@@ -1,0 +1,25 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
+
+# Exported findings (including custom output directories)
+reports/
+*.csv
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
