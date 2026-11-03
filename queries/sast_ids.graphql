@@ -1,0 +1,7 @@
+# SAST current starter: IDs only, no resource-group filtering yet.
+query SelectedSASTFindings($first: Int, $after: String) {
+  findings: sastFindings(first: $first, after: $after) {
+    nodes { id }
+    pageInfo { hasNextPage endCursor }
+  }
+}
