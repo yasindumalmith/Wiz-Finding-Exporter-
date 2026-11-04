@@ -1,0 +1,22 @@
+query GetSASTRepositories($first: Int, $after: String) {
+  repositories: sastFindingsGroupedByValues(
+    first: $first
+    after: $after
+    groupBy: { fields: [REPOSITORY] }
+  ) {
+    totalCount
+    nodes {
+      id
+      repository { id name platform }
+      analytics {
+        findingCount
+        criticalSeverityCount
+        highSeverityCount
+        mediumSeverityCount
+        lowSeverityCount
+        informationalSeverityCount
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}

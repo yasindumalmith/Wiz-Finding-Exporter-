@@ -1,24 +1,30 @@
 # Wiz Two-Menu CSV Exporter — Read-Only POC
 
-This is a **separate project** and does **not modify** the previous Wiz exporter. The CLI lets you select **(1) a finding category** and **(2) a resource group**, then choose a specific group member when supported. It writes CSV only after an actual scoped Wiz GraphQL query succeeds.
+This is a **separate project** and does **not modify** the previous Wiz exporter. The CLI lets you select **(1) a finding category** and **(2) a resource group**, then choose a specific group member when supported. The SAST → Code Repository route discovers repositories in Wiz and exports their detailed findings. Other supported routes retain their existing behavior.
 
 ## Start on Ubuntu
 
 ```bash
-unzip wiz_two_menu_poc.zip
 cd wiz_two_menu_poc
 python3 -m venv .venv
 source .venv/bin/activate
 pip install requests
 export WIZ_API_URL='https://api.YOUR_REGION.app.wiz.io/graphql'
-export WIZ_AUTH_URL='https://auth.app.wiz.io/oauth/token' # adapt for tenant
 export WIZ_CLIENT_ID='YOUR_CLIENT_ID'
 read -rsp 'Wiz Client Secret: ' WIZ_CLIENT_SECRET; echo
 export WIZ_CLIENT_SECRET
 python3 wiz_two_menu_export.py
 ```
 
-Keep credentials and exported findings out of Git. Never paste a token or secret into this chat. API permission scopes depend on the category; typical ones are `read:vulnerabilities`, `read:projects`, and `read:resources` for relevant inventory.
+`WIZ_API_URL`, `WIZ_CLIENT_ID`, and `WIZ_CLIENT_SECRET` are required. `WIZ_AUTH_URL` defaults to `https://auth.app.wiz.io/oauth/token`; set it if your tenant uses another auth endpoint. `WIZ_AUDIENCE` defaults to `wiz-api`. Ensure the client has permission to read the relevant Wiz findings and inventory. Keep credentials and exported findings out of Git. Never paste a token or secret into this chat.
+
+## SAST repository export
+
+Run `python3 wiz_two_menu_export.py`, then choose **2. SAST Findings**, **2. Code Repository**, and a repository from the numbered list. The list comes from `sastFindingsGroupedByValues` using `REPOSITORY`; it shows each repository name, finding count, and platform. The script follows every repository-group cursor before showing the list. It uses `repository.id` from the selected group, not the group's JSON-encoded `id`.
+
+The script then calls `sastFindings` with the selected repository ID in `filterBy.resource.repositoryId.equals`. It follows every finding cursor by default and writes a detailed CSV in `reports/`, for example `reports/sast_wiz-code-demo_public-demo.csv`. Use `--out-dir PATH` for another output directory. The file includes finding details, repository and branch columns, code location, timestamps, and source URL. Null values become empty cells. CSV quoting handles multiline text; spreadsheet formula escaping and UTF-8 with BOM remain enabled.
+
+Use `python3 wiz_two_menu_export.py --page-size 100` to request larger pages. To request a finding sample, use `python3 wiz_two_menu_export.py --max-pages 1`. The repository list is still fetched completely; only the chosen repository's findings are page-limited. SAST repository sample filenames include `_sample`; if more pages existed, they also include `_partial`. Other routes still default to one finding page. `--max-pages 0` explicitly requests all pages and prompts for confirmation, as before. Existing report files are never overwritten; repeat exports receive a numeric suffix.
 
 ## What actually works *without additional tenant schema mapping?*
 
@@ -31,10 +37,11 @@ Keep credentials and exported findings out of Git. Never paste a token or secret
 | Vulnerability Findings | Kubernetes Cluster | Requires all related workload/image *affected asset IDs* in `resource_groups.json` |
 | Vulnerability Findings | Kubernetes Namespace | Requires related affected asset IDs in `resource_groups.json` |
 | SAST Findings | No group | Queries IDs only; must validate `sastFindings` in tenant |
-| SAST Findings | Any specific group | Tenant profile and supported filter required |
+| SAST Findings | Code Repository | Dynamically lists repository groups, then exports all detailed findings for the selected repository by default; demo-tenant workflow supplied by user, live validation of this code pending |
+| SAST Findings | Other specific groups | Tenant profile and supported filter required |
 | Secrets, configuration, host, etc. | Any group | Tenant profile and supported filter required (not assumed) |
 
-**Not yet an automatic clone of the Wiz GUI group-by menu.** In Wiz the GUI can group by Security Graph relationships that are not guaranteed to map to a direct `filterBy` field. This code explicitly refuses unsupported combinations instead of giving misleading CSVs.
+The menu's Group By options are still hardcoded. Only SAST → Code Repository discovers group members from grouped finding results. Other grouping dimensions and category-specific discovery are planned for later phases. In Wiz the GUI can group by Security Graph relationships that are not guaranteed to map to a direct `filterBy` field. This code explicitly refuses unsupported combinations instead of giving misleading CSVs.
 
 ## Group/resource ID mapping (for Vulnerability Findings)
 
@@ -77,14 +84,15 @@ The script **does not assume** that the same fields/filters are supported by all
 
 ## Limits and completeness
 
-`--page-size 10 --max-pages 1` is default; therefore CSV is a sample. For a complete selected group use `--page-size 100 --max-pages 0` after verifying a narrow resource scope and confirming the command. Report completeness depends on both the resolved asset mapping and exhausting pagination, and changes in Wiz during pagination can affect counts.
+The default page size is 10. SAST → Code Repository fetches all group pages and all matching finding pages unless `--max-pages` is explicitly set. Other routes default to one finding page. For a complete export on those routes use `--page-size 100 --max-pages 0` after verifying a narrow resource scope and confirming the command. A page-limited export with more results is marked `_partial` in its filename and terminal output. Report completeness also depends on any manually resolved asset mapping, and changes in Wiz during pagination can affect counts.
 
 ## Errors are intentional
 
 - Missing permissions or unsupported GraphQL fields: exit; no report.
 - Resource group not mapped: exit; no report.
 - Invalid/missing API token: exit; no report.
-- `hasNextPage` with a max-pages cutoff: report marked **partial** in terminal output.
+- Missing or repeated pagination cursor, or malformed page information: exit without a report.
+- `hasNextPage` with a max-pages cutoff: report marked **partial** in its filename and terminal output.
 - No matches: header-only CSV, provided the query succeeded.
 
 ## References

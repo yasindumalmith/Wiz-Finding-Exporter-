@@ -1,0 +1,28 @@
+query SelectedSASTRepositoryFindings(
+  $first: Int
+  $after: String
+  $filterBy: SASTFindingFilters
+) {
+  findings: sastFindings(first: $first, after: $after, filterBy: $filterBy) {
+    nodes {
+      id
+      name
+      severity
+      status
+      description
+      repository { id name platform }
+      repositoryBranch { id name }
+      filePath
+      startLine
+      endLine
+      snippet
+      codeLibraryLanguage
+      remediationInstructions
+      createdAt
+      updatedAt
+      firstDetectedAtSource
+      sourceUrl
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}

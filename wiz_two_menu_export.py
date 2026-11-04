@@ -40,6 +40,14 @@ GROUPS = [
     ("kubernetes_namespace", "Kubernetes Namespace"),
     ("all", "No resource grouping (sample only)"),
 ]
+SAST_REPOSITORY_COLUMNS = [
+    "name", "severity", "status", "description",
+    "repository.id", "repository.name", "repository.platform",
+    "repositoryBranch.id", "repositoryBranch.name",
+    "filePath", "startLine", "endLine", "codeLibraryLanguage", "snippet",
+    "remediationInstructions", "createdAt", "updatedAt",
+    "firstDetectedAtSource", "sourceUrl",
+]
 
 
 def menu(title: str, entries: list[str]) -> int:
@@ -130,28 +138,33 @@ class WizClient:
 
 
 def fetch_connection(client: WizClient, query: str, variables: dict, alias: str,
-                     page_size: int, max_pages: int) -> tuple[list[dict], bool]:
+                     page_size: int, max_pages: int,
+                     label: str = "findings") -> tuple[list[dict], bool]:
     results = []
     cursor = None
     seen = set()
     partial = False
-    for page in range(max_pages if max_pages else 1000000):
+    page = 0
+    while True:
         data = client.graphql(query, {**variables, "first": page_size, "after": cursor})
         conn = data.get(alias)
         if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
             raise RuntimeError(f"Expected data.{alias}.nodes; check your tenant's GraphQL schema")
         results.extend(conn["nodes"])
-        info = conn.get("pageInfo") or {}
-        print(f"  Page {page + 1}: received {len(conn['nodes'])} findings", flush=True)
-        if not info.get("hasNextPage"):
-            break
-        if max_pages and (page + 1) >= max_pages:
-            partial = True
+        info = conn.get("pageInfo")
+        if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+            raise RuntimeError(f"Missing/malformed data.{alias}.pageInfo; refusing incomplete export")
+        page += 1
+        print(f"  Page {page}: received {len(conn['nodes'])} {label}", flush=True)
+        if not info["hasNextPage"]:
             break
         new_cursor = info.get("endCursor")
-        if not new_cursor or new_cursor in seen:
+        if not isinstance(new_cursor, str) or not new_cursor.strip() or new_cursor in seen:
             raise RuntimeError("Missing/repeated pagination cursor; refusing incomplete export")
         seen.add(new_cursor)
+        if max_pages and page >= max_pages:
+            partial = True
+            break
         cursor = new_cursor
     return results, partial
 
@@ -168,6 +181,45 @@ def get_projects(client: WizClient) -> list[dict]:
         print("WARNING: Project list is incomplete; use manual ID for a missing project")
     return sorted((p for p in projects if p.get("id")),
                   key=lambda p: str(p.get("name") or ""))
+
+
+def get_sast_repositories(client: WizClient, page_size: int) -> list[dict]:
+    query = (BASE / "queries" / "sast_repositories.graphql").read_text(encoding="utf-8")
+    groups, _ = fetch_connection(client, query, {}, "repositories", page_size, 0,
+                                 label="repository groups")
+    repositories = {}
+    skipped = 0
+    for group in groups:
+        repository = group.get("repository") if isinstance(group, dict) else None
+        repo_id = repository.get("id") if isinstance(repository, dict) else None
+        if not isinstance(repo_id, str) or not repo_id.strip():
+            skipped += 1
+            continue
+        analytics = group.get("analytics") or {}
+        if not isinstance(analytics, dict):
+            analytics = {}
+        repositories.setdefault(repo_id, {
+            "id": repo_id,
+            "name": repository.get("name") or repo_id,
+            "platform": repository.get("platform") or "",
+            "finding_count": analytics.get("findingCount"),
+        })
+    if skipped:
+        print(f"WARNING: Skipped {skipped} repository groups without a valid repository ID.")
+    return sorted(repositories.values(), key=lambda repo: (str(repo["name"]).casefold(), repo["id"]))
+
+
+def select_sast_repository(client: WizClient, page_size: int) -> tuple[str, list[str]]:
+    repositories = get_sast_repositories(client, page_size)
+    if not repositories:
+        raise RuntimeError("No SAST repository groups with valid repository IDs were returned. No CSV generated.")
+    options = [
+        f"{repo['name']} — {repo['finding_count'] if repo['finding_count'] is not None else '?'} findings"
+        f" ({repo['platform'] or 'platform unknown'})"
+        for repo in repositories
+    ]
+    selected = repositories[menu("STEP 3 — Select SAST Repository", options)]
+    return str(selected["name"]), [selected["id"]]
 
 
 def load_group_mapping(path: Path, group: str) -> list[dict]:
@@ -214,8 +266,8 @@ def select_group(client: WizClient, group: str, mapping_path: Path) -> tuple[str
     return str(entry["name"]), list(dict.fromkeys(ids))
 
 
-def prepare_plan(category: str, group: str, ids: list[str], profiles: dict) -> tuple[str, dict, str, str]:
-    """Return query, base variables, output label, and split-list filter key."""
+def prepare_plan(category: str, group: str, ids: list[str], profiles: dict) -> tuple[str, dict, str, str | tuple[str, ...]]:
+    """Return query, base variables, output label, and list-filter path."""
     if category == "vulnerability":
         query_path = BASE / "queries" / "vulnerability_filtered.graphql"
         if group == "project":
@@ -225,6 +277,10 @@ def prepare_plan(category: str, group: str, ids: list[str], profiles: dict) -> t
         return query_path.read_text(encoding="utf-8"), {"filterBy": {"assetId": ids}}, "Vulnerability", "assetId"
     if category == "sast" and group == "all":
         return (BASE / "queries" / "sast_ids.graphql").read_text(encoding="utf-8"), {}, "SAST", ""
+    if category == "sast" and group == "code_repository":
+        query = (BASE / "queries" / "sast_repository_findings.graphql").read_text(encoding="utf-8")
+        variables = {"filterBy": {"resource": {"repositoryId": {"equals": ids}}}}
+        return query, variables, "SAST", ("resource", "repositoryId", "equals")
     # Other category/group combinations require tenant-reviewed query and filter mapping.
     profile = profiles.get(category, {})
     query_relative = profile.get("query")
@@ -246,34 +302,64 @@ def prepare_plan(category: str, group: str, ids: list[str], profiles: dict) -> t
 
 
 def export(client: WizClient, category: str, group: str, resource: str, ids: list[str],
-           page_size: int, max_pages: int, profiles: dict, output_dir: Path):
+           page_size: int, max_pages: int, profiles: dict, output_dir: Path) -> Path:
     query, vars_base, label, list_key = prepare_plan(category, group, ids, profiles)
     # Guard: a query that doesn't declare $filterBy cannot enforce resource filtering.
     if group != "all" and "$filterBy" not in query:
         raise RuntimeError("Selected resource filter is absent from query; export refused")
     # Batch large related-resource ID sets, deduplicate findings across overlapping assets.
     id_batches = [ids[i:i + 30] for i in range(0, len(ids), 30)] if group != "all" else [[]]
+    if not id_batches:
+        raise RuntimeError("Selected resource has no IDs; refusing unfiltered export")
     unique = {}
     incomplete = False
     for batch_no, batch in enumerate(id_batches, 1):
         variables = json.loads(json.dumps(vars_base))
         if list_key:
-            variables["filterBy"][list_key] = batch
+            path = (list_key,) if isinstance(list_key, str) else list_key
+            target = variables["filterBy"]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = batch
         print(f"Fetching batch {batch_no}/{len(id_batches)}...")
         findings, partial = fetch_connection(client, query, variables, "findings", page_size, max_pages)
         incomplete |= partial
         for idx, finding in enumerate(findings):
             if not isinstance(finding, dict):
                 raise RuntimeError("Unexpected finding record format")
+            if category == "sast" and group == "code_repository":
+                if not finding.get("id"):
+                    raise RuntimeError("SAST finding has no ID; refusing incomplete export")
+                repository = finding.get("repository")
+                if not isinstance(repository, dict) or repository.get("id") not in ids:
+                    raise RuntimeError("SAST finding repository does not match the selected repository")
             key = str(finding.get("id") or f"{batch_no}:{idx}")
             unique[key] = finding
     rows = [{"finding_category": label, "group_type": group,
              "group_name": resource, **flatten(n)} for n in unique.values()]
     fields = ["finding_category", "group_type", "group_name", "id"]
+    if category == "sast" and group == "code_repository":
+        fields += SAST_REPOSITORY_COLUMNS
     fields += sorted({k for r in rows for k in r} - set(fields))
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{safe_slug(category)}_{safe_slug(group)}_{safe_slug(resource)}.csv"
-    with output.open("w", newline="", encoding="utf-8-sig") as f:
+    if category == "sast" and group == "code_repository":
+        stem = f"sast_{safe_slug(resource)}"
+        if max_pages:
+            stem += "_sample"
+    else:
+        stem = f"{safe_slug(category)}_{safe_slug(group)}_{safe_slug(resource)}"
+    if incomplete:
+        stem += "_partial"
+    sequence = 1
+    while True:
+        suffix = "" if sequence == 1 else f"_{sequence}"
+        output = output_dir / f"{stem}{suffix}.csv"
+        try:
+            f = output.open("x", newline="", encoding="utf-8-sig")
+            break
+        except FileExistsError:
+            sequence += 1
+    with f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
@@ -281,20 +367,21 @@ def export(client: WizClient, category: str, group: str, resource: str, ids: lis
     print(f"\nCSV saved: {output} ({len(rows)} unique findings)")
     if incomplete:
         print("WARNING: Page limit reached. This CSV is a PARTIAL sample, not a complete group export.")
-    if category == "sast":
+    if category == "sast" and group == "all":
         print("Note: current SAST query returns finding IDs only; additional fields need API Explorer validation.")
+    return output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--page-size", type=int, default=10)
-    parser.add_argument("--max-pages", type=int, default=1,
-                        help="Per query/batch; default 1 page. 0 retrieves all pages.")
+    parser.add_argument("--max-pages", type=int, default=None,
+                        help="Per finding query/batch. Default: all SAST repository pages, one page otherwise; 0 retrieves all pages.")
     parser.add_argument("--groups", type=Path, default=BASE / "resource_groups.json")
     parser.add_argument("--profiles", type=Path, default=BASE / "tenant_profiles.json")
     parser.add_argument("--out-dir", type=Path, default=BASE / "reports")
     args = parser.parse_args()
-    if not 1 <= args.page_size <= 200 or args.max_pages < 0:
+    if not 1 <= args.page_size <= 200 or (args.max_pages is not None and args.max_pages < 0):
         parser.error("--page-size must be between 1 and 200, --max-pages >= 0")
     print("Wiz two-menu CSV exporter (read-only POC)")
     category_idx = menu("STEP 1 — Select Finding Category", [item[1] for item in MENU])
@@ -303,7 +390,7 @@ def main():
     group = GROUPS[group_idx][0]
     profiles = json.loads(args.profiles.read_text(encoding="utf-8")) if args.profiles.exists() else {}
     # Fail-fast unsupported category/group before attempting authentication.
-    if category != "vulnerability" and not (category == "sast" and group == "all"):
+    if category != "vulnerability" and not (category == "sast" and group in ("all", "code_repository")):
         if not profiles.get(category, {}).get("query"):
             raise RuntimeError(
                 "This category/group needs a tenant-verified GraphQL query and filter mapping. "
@@ -313,13 +400,16 @@ def main():
         answer = input("This may fetch many records. Type YES to continue: ").strip()
         if answer != "YES":
             raise SystemExit("Cancelled")
+    max_pages = args.max_pages if args.max_pages is not None else (0 if category == "sast" and group == "code_repository" else 1)
     client = WizClient()
     print("Authenticated (token hidden).")
     if group == "all":
         name, ids = "all_accessible", []
+    elif category == "sast" and group == "code_repository":
+        name, ids = select_sast_repository(client, args.page_size)
     else:
         name, ids = select_group(client, group, args.groups)
-    export(client, category, group, name, ids, args.page_size, args.max_pages, profiles, args.out_dir)
+    export(client, category, group, name, ids, args.page_size, max_pages, profiles, args.out_dir)
 
 
 if __name__ == "__main__":
