@@ -8,7 +8,7 @@ This is a **separate project** and does **not modify** the previous Wiz exporter
 cd wiz_two_menu_poc
 python3 -m venv .venv
 source .venv/bin/activate
-pip install requests
+pip install -r requirements.txt
 export WIZ_API_URL='https://api.YOUR_REGION.app.wiz.io/graphql'
 export WIZ_CLIENT_ID='YOUR_CLIENT_ID'
 read -rsp 'Wiz Client Secret: ' WIZ_CLIENT_SECRET; echo
@@ -17,6 +17,29 @@ python3 wiz_two_menu_export.py
 ```
 
 `WIZ_API_URL`, `WIZ_CLIENT_ID`, and `WIZ_CLIENT_SECRET` are required. `WIZ_AUTH_URL` defaults to `https://auth.app.wiz.io/oauth/token`; set it if your tenant uses another auth endpoint. `WIZ_AUDIENCE` defaults to `wiz-api`. Ensure the client has permission to read the relevant Wiz findings and inventory. Keep credentials and exported findings out of Git. Never paste a token or secret into this chat.
+
+## Run with Docker
+
+From the project directory, build the image and create a host directory for CSV reports:
+
+```bash
+docker build -t wiz-two-menu-exporter .
+mkdir -p reports
+```
+
+Export the three required environment variables in your shell as shown above, then run the interactive menu:
+
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  --env WIZ_API_URL \
+  --env WIZ_CLIENT_ID \
+  --env WIZ_CLIENT_SECRET \
+  --mount "type=bind,src=$(pwd)/reports,dst=/app/reports" \
+  wiz-two-menu-exporter
+```
+
+CSV files appear in the host `reports/` directory. The `--user` option lets the container write files as your Linux user. If you use optional `WIZ_AUTH_URL` or `WIZ_AUDIENCE` settings, add `--env WIZ_AUTH_URL` or `--env WIZ_AUDIENCE` to the run command. Exporter arguments go after the image name, for example `wiz-two-menu-exporter --page-size 100`. To use edited `resource_groups.json`, `tenant_profiles.json`, or query files without rebuilding, mount those files into `/app` with Docker's read-only bind mounts.
 
 ## SAST repository export
 
